@@ -12,7 +12,7 @@
 # ---
 
 # %% [markdown] id="view-in-github" colab_type="text"
-# <a href="https://colab.research.google.com/github/rawanmd/segmentation_coverless_steg/blob/main/Segmentation_Coverless_Steg.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+# <a href="https://colab.research.google.com/github/rawanmd/segmentation_coverless_steg/blob/adaptive_window/Segmentation_Coverless_Steg.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
 # %% id="alEU1axrq2-w"
 from textwrap import indent
@@ -22,7 +22,10 @@ import os
 import glob
 import json
 
-# %% colab={"base_uri": "https://localhost:8080/"} id="D6pNBetB1ebx" outputId="08a1f8ba-f499-430c-e4fd-098ac088e932"
+# %% [markdown] id="WjB_xCHxJL4C"
+# ## Connect to Drive
+
+# %% colab={"base_uri": "https://localhost:8080/"} id="D6pNBetB1ebx" outputId="debccb37-1bee-4f7c-bc52-aad11cbfd492"
 from google.colab import drive
 
 # Mount Drive
@@ -75,7 +78,7 @@ os.makedirs("val", exist_ok=True)
 # %% [markdown] id="0ellvUphd1IU"
 # ## Import SAM
 
-# %% colab={"base_uri": "https://localhost:8080/"} id="5b4D_cNmfszT" outputId="e1d4abb6-6841-4fe6-869a-3ecfdb8fe04e"
+# %% colab={"base_uri": "https://localhost:8080/"} id="5b4D_cNmfszT" outputId="04c1d80c-49ad-4c2d-c299-cf9d3357d169"
 # !pip install git+https://github.com/facebookresearch/segment-anything.git
 # !pip install opencv-python pycocotools matplotlib
 # !pip install torch torchvision
@@ -99,6 +102,11 @@ sam.to(device=device)
 
 mask_generator = SamAutomaticMaskGenerator(sam)
 
+
+# %% [markdown] id="pjruehLAzgwf"
+# ## Functions
+
+# %% id="p9kSYrulYYLT"
 def extract_masks(image_path):
 
   import math
@@ -126,11 +134,6 @@ def extract_masks(image_path):
 
   return binary_seq, len(binary_seq)
 
-
-# %% [markdown] id="pjruehLAzgwf"
-# ## Create the Inverted Index
-
-# %% id="p9kSYrulYYLT"
 def get_image_paths(dir):
   image_paths = sorted(glob.glob(os.path.join(dir, '*.jpg')))
   print(f"Found {len(image_paths)} images.")
@@ -158,14 +161,54 @@ def build_index(image_paths):
   return index
 
 
+# %% id="BbA3BWjOp05k"
+def match_msg_to_images(binary_msg, window_size, index):
+  while window_size > 0:
+
+      image_paths = []
+      success = True
+
+      print(f"\nTrying window size: {window_size}")
+
+      for i in range(0, len(binary_msg), window_size):
+
+          chunk = binary_msg[i:i + window_size]
+          num_zeros = 0
+
+          # add trailing zeros to last chunk
+          if len(chunk) < window_size:
+              num_zeros = window_size - len(chunk)
+              chunk = chunk.ljust(window_size, '0')
+
+          print(f"chunk: {chunk}")
+
+          key = ''
+
+          for idx in index:
+              if idx.startswith(chunk):
+                  key = idx
+                  break
+
+          if key == '':
+              print(f"No match for {chunk}")
+              success = False
+              break
+
+          image_paths.append(index[key][0]['image path'])
+          print(f"key: {key}")
+
+      if success:
+          print(f"image paths: {image_paths}")
+          print(f"Final window size: {window_size}")
+          return image_paths, window_size, num_zeros
+
+      window_size -= 1
+
+  return [], -1, -1
+
+
 # %% [markdown] id="e8JvDxal1iZc"
 # ## Pipeline
-
-# %% [markdown] id="AHZ4MDXE0fyA"
-# ### Text Encryption
-
-# %% [markdown] id="kBA-n0Hf0nVi"
-# ### Divide and match the message to images
 
 # %% id="DpiK-TGz1tsQ"
 PATH = "/content/drive/MyDrive/coco_dataset/train2017"
@@ -176,6 +219,7 @@ ascii_secret_msg = [ord(char) for char in secret_msg]
 # add text enc here
 
 binary_msg = [f"{val:08b}" for val in ascii_secret_msg]
+binary_msg = ''.join(binary_msg)
 
 # build index if not already there
 # index = build_index(PATH)
@@ -185,46 +229,11 @@ index = None
 with open("/content/drive/MyDrive/coco_dataset/inverted_index.json", "r") as f:
   index = json.load(f)
 
+# %% colab={"base_uri": "https://localhost:8080/"} id="v27igmcqyAwP" outputId="6729349b-9f34-4286-8815-91d349fe1dd7"
+window_size = len(max(index.keys(), key=len))
+print(f"Max window size in index: {window_size}")
 
+# all_keys, w_size, num_zeros = match_msg_to_images(binary_msg, window_size, index)
+all_keys, w_size, num_zeros = match_msg_to_images('1101111', 4, index)  # just an example for tracing
 
-# %% colab={"base_uri": "https://localhost:8080/"} id="Zk6yeACrrOBr" outputId="7079c13c-27ac-4b07-ea14-fd606ef58c88"
-window_size = max(len(key) for key in index.keys())
-print("Largest length:", window_size)
-
-for chunk in binary_msg:
-
-
-# %% colab={"base_uri": "https://localhost:8080/"} id="YDlaXHFdsUJt" outputId="10a80ce6-0e78-4aba-81c3-72ab7db68268"
-window_size = 10
-
-prefix_map = {}
-
-for code in index.keys():
-    prefix = code[:window_size]
-
-    if prefix not in prefix_map:
-        prefix_map[prefix] = []
-
-    prefix_map[prefix].append(code)
-
-prefix_map["0110011010"]
-
-# %% colab={"base_uri": "https://localhost:8080/"} id="MHmBE3rGeKUi" outputId="5a3cc4fb-a6d4-4dcb-c817-5ac53dd07487"
-all_codes = list(index.keys())
-
-print(index.keys())
-
-prefix_map = {}
-
-for window_size in range(10):
-  for code in all_codes:
-      # window_size = index[code][0]['length']
-      prefix = code[:window_size]
-      if prefix not in prefix_map:
-          prefix_map[prefix] = []
-
-      prefix_map[prefix].append(code)
-
-prefix_map
-
-# %% id="CzFAJoHQeT4z"
+# %% id="8jWsyk0rpmns"
