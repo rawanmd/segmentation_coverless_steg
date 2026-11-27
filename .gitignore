@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS, notebook outputs, and local virtual environments
+.DS_Store
+*_output.ipynb
+.venv/
