@@ -140,6 +140,21 @@ def compare_neighbors(features: np.ndarray, tolerance: float = 0.02) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _infer_entry_meta(data: Mapping[str, Any], field: str) -> int:
+    seg = data.get("segmentation")
+    if seg is not None:
+        shape = seg.shape if hasattr(seg, "shape") else np.asarray(seg).shape
+        if field == "mask_count":
+            return int(shape[0])
+        if shape[0] > 0:
+            return int(shape[1] if field == "height" else shape[2])
+    if field in ("height", "width") and "crop_box" in data:
+        crop = data["crop_box"]
+        if crop is not None and len(crop) > 0:
+            return int(crop[0][3 if field == "height" else 2])
+    return 0
+
+
 class H5Entry(Mapping[str, Any]):
     """Lazy dict-like view over an HDF5 group with legacy height/width fallbacks."""
 
@@ -156,20 +171,8 @@ class H5Entry(Mapping[str, Any]):
             return val.item() if isinstance(val, np.generic) else val
         if k in g:
             return g[k][:]
-        if k == "height":
-            if "segmentation" in g:
-                return int(g["segmentation"].shape[1])
-            if "crop_box" in g and len(g["crop_box"]) > 0:
-                return int(g["crop_box"][0][3])
-            return 0
-        if k == "width":
-            if "segmentation" in g:
-                return int(g["segmentation"].shape[2])
-            if "crop_box" in g and len(g["crop_box"]) > 0:
-                return int(g["crop_box"][0][2])
-            return 0
-        if k == "mask_count":
-            return int(g["segmentation"].shape[0]) if "segmentation" in g else 0
+        if k in ("height", "width", "mask_count"):
+            return _infer_entry_meta(g, k)
         if k == "key":
             return self.key
         raise KeyError(k)
@@ -187,30 +190,9 @@ def _normalize_dict_entry(raw: Mapping[str, Any], key: str = "") -> Mapping[str,
         return raw
     entry = dict(raw)
     entry.setdefault("key", key)
-    if "masks" in entry and "segmentation" not in entry:
-        masks = entry["masks"]
-        if masks:
-            for field in masks[0].keys():
-                entry.setdefault(field, np.stack([m[field] for m in masks]))
-        entry.setdefault("mask_count", len(masks))
-    seg = entry.get("segmentation")
-    crop = entry.get("crop_box")
-    if "height" not in entry:
-        if seg is not None and len(seg) > 0:
-            entry["height"] = int(np.asarray(seg).shape[1])
-        elif crop is not None and len(crop) > 0:
-            entry["height"] = int(crop[0][3])
-        else:
-            entry["height"] = 0
-    if "width" not in entry:
-        if seg is not None and len(seg) > 0:
-            entry["width"] = int(np.asarray(seg).shape[2])
-        elif crop is not None and len(crop) > 0:
-            entry["width"] = int(crop[0][2])
-        else:
-            entry["width"] = 0
-    if "mask_count" not in entry:
-        entry["mask_count"] = int(len(seg)) if seg is not None else 0
+    for field in ("height", "width", "mask_count"):
+        if field not in entry:
+            entry[field] = _infer_entry_meta(entry, field)
     return entry
 
 
@@ -261,7 +243,13 @@ def _open_source(source: Any, mask_generator: Any = None):
 
         def _get_h5(key: str) -> H5Entry:
             nonlocal path_map
-            if key in source:
+            if (
+                key
+                and "/" not in key
+                and not key.startswith("temp_")
+                and key in source
+                and isinstance(source[key], h5py.Group)
+            ):
                 return H5Entry(source[key], key)
             if path_map is None:
                 path_map = {}
@@ -335,7 +323,34 @@ class CoverlessStegPort(ABC):
         self.source = source
         self.mask_generator = mask_generator
         self._prefix_maps: dict[int, dict[str, list[Any]]] | None = None
-        self._cached_source: Any = None
+        self._cache_key: tuple[Any, ...] | None = None
+
+    def _compute_cache_key(self) -> tuple[Any, ...]:
+        def _val_sig(x: Any) -> Any:
+            return x if isinstance(x, (int, float, str, bool, bytes, Path, type(None))) else id(x)
+
+        src = self.source
+        if isinstance(src, dict):
+            src_sig: Any = (
+                id(src),
+                tuple(
+                    (
+                        k,
+                        tuple((ik, _val_sig(iv)) for ik, iv in sorted(v.items()))
+                        if isinstance(v, dict)
+                        else _val_sig(v),
+                    )
+                    for k, v in src.items()
+                ),
+            )
+        else:
+            src_sig = _val_sig(src)
+        cfg_sig = tuple(
+            (k, _val_sig(v))
+            for k, v in sorted(self.__dict__.items())
+            if not k.startswith("_") and k != "source"
+        )
+        return (src_sig, cfg_sig)
 
     @abstractmethod
     def encode_entry(self, entry: Mapping[str, Any]) -> str:
@@ -368,9 +383,10 @@ class CoverlessStegPort(ABC):
             return [], 0, 0
 
         if prefix_maps is None:
-            if self._prefix_maps is None or self._cached_source is not self.source:
+            ck = self._compute_cache_key()
+            if self._prefix_maps is None or self._cache_key != ck:
                 self._prefix_maps = build_prefix_maps(self.build_index(self.source))
-                self._cached_source = self.source
+                self._cache_key = ck
             prefix_maps = self._prefix_maps
 
         if not prefix_maps:
@@ -513,6 +529,13 @@ def generate_sam_h5(
     seed: int = 42,
 ) -> Path:
     """Run SAM over *images_path* and write compressed mask outputs to an HDF5 file."""
+    if isinstance(images_path, (str, Path)):
+        paths = get_image_paths(images_path)[:num_images]
+    else:
+        paths = [str(p) for p in list(images_path)[:num_images]]
+    if not paths:
+        raise FileNotFoundError(f"No images found in {images_path!r}")
+
     out = Path(output_file)
     if str(output_file).endswith(("/", os.sep)) or out.is_dir():
         if with_noise and with_compression:
@@ -525,11 +548,7 @@ def generate_sam_h5(
             tag = "clean"
         out = out / f"SAM_outputs_{tag}.h5"
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    if isinstance(images_path, (str, Path)):
-        paths = get_image_paths(images_path)[:num_images]
-    else:
-        paths = [str(p) for p in list(images_path)[:num_images]]
+    existed_before = out.exists()
 
     try:
         import torch  # type: ignore
@@ -542,97 +561,107 @@ def generate_sam_h5(
         bgr = cv2.imread(im_path)
         return None if bgr is None else cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    with h5py.File(
-        out, "a", rdcc_nbytes=64 * 1024 * 1024, rdcc_nslots=10007, rdcc_w0=1.0
-    ) as h5:
-        existing_keys = set(h5.keys())
-        pending = [
-            (i, f"{i:04d}", im)
-            for i, im in enumerate(paths)
-            if f"{i:04d}" not in existing_keys
-        ]
-        if not pending:
-            return out
+    try:
+        with h5py.File(
+            out, "a", rdcc_nbytes=64 * 1024 * 1024, rdcc_nslots=10007, rdcc_w0=1.0
+        ) as h5:
+            existing_keys = set(h5.keys())
+            pending = [
+                (i, f"{i:04d}", im)
+                for i, im in enumerate(paths)
+                if f"{i:04d}" not in existing_keys
+            ]
+            if not pending:
+                return out
 
-        def _write_entry(
-            key: str,
-            im_path: str,
-            height: int,
-            width: int,
-            r_mean: float,
-            outputs: list[dict[str, Any]],
-        ) -> None:
-            temp_key = f"temp_{key}"
-            if temp_key in h5:
-                del h5[temp_key]
-            group = h5.create_group(temp_key)
-            group.attrs["image_path"] = im_path
-            group.attrs["mask_count"] = len(outputs)
-            group.attrs["height"] = height
-            group.attrs["width"] = width
-            group.attrs["r_mean"] = r_mean
-            if outputs:
-                for field in outputs[0].keys():
-                    values = np.stack([m[field] for m in outputs])
-                    group.create_dataset(
-                        field, data=values, compression="gzip", compression_opts=4
-                    )
-            h5.move(temp_key, key)
-
-        prefetch_limit = 8
-        max_queued_writes = 2
-        pending_iter = iter(pending)
-        read_futures: deque[tuple[int, str, str, Any]] = deque()
-        write_futures: deque[Any] = deque()
-
-        with (
-            ThreadPoolExecutor(max_workers=4) as reader_pool,
-            ThreadPoolExecutor(max_workers=1) as writer_pool,
-            inference_ctx(),
-        ):
-            try:
-                for _ in range(prefetch_limit):
-                    nxt = next(pending_iter, None)
-                    if nxt is None:
-                        break
-                    idx, k, im = nxt
-                    read_futures.append((idx, k, im, reader_pool.submit(_load_rgb, im)))
-
-                while read_futures:
-                    idx, key, im, fut = read_futures.popleft()
-                    nxt = next(pending_iter, None)
-                    if nxt is not None:
-                        nidx, nk, nim = nxt
-                        read_futures.append((nidx, nk, nim, reader_pool.submit(_load_rgb, nim)))
-
-                    image = fut.result()
-                    if image is None:
-                        continue
-
-                    if with_noise:
-                        image = apply_gaussian_noise(
-                            image, mean=noise_mean, variance=noise_variance, rng=seed + idx
+            def _write_entry(
+                key: str,
+                im_path: str,
+                height: int,
+                width: int,
+                r_mean: float,
+                outputs: list[dict[str, Any]],
+            ) -> None:
+                temp_key = f"temp_{key}"
+                if temp_key in h5:
+                    del h5[temp_key]
+                group = h5.create_group(temp_key)
+                group.attrs["image_path"] = im_path
+                group.attrs["mask_count"] = len(outputs)
+                group.attrs["height"] = height
+                group.attrs["width"] = width
+                group.attrs["r_mean"] = r_mean
+                if outputs:
+                    for field in outputs[0].keys():
+                        values = np.stack([m[field] for m in outputs])
+                        group.create_dataset(
+                            field, data=values, compression="gzip", compression_opts=4
                         )
-                    if with_compression:
-                        image = apply_jpeg_comp(image, quality=jpeg_quality)
+                h5.move(temp_key, key)
 
-                    h_px, w_px = int(image.shape[0]), int(image.shape[1])
-                    r_mean = float(np.mean(image[:, :, 0]))
-                    outputs = mask_generator.generate(image)
-                    del image
+            prefetch_limit = 8
+            max_queued_writes = 2
+            pending_iter = iter(pending)
+            read_futures: deque[tuple[int, str, str, Any]] = deque()
+            write_futures: deque[Any] = deque()
 
-                    if len(write_futures) >= max_queued_writes:
+            with (
+                ThreadPoolExecutor(max_workers=4) as reader_pool,
+                ThreadPoolExecutor(max_workers=1) as writer_pool,
+                inference_ctx(),
+            ):
+                try:
+                    for _ in range(prefetch_limit):
+                        nxt = next(pending_iter, None)
+                        if nxt is None:
+                            break
+                        idx, k, im = nxt
+                        read_futures.append((idx, k, im, reader_pool.submit(_load_rgb, im)))
+
+                    while read_futures:
+                        idx, key, im, fut = read_futures.popleft()
+                        nxt = next(pending_iter, None)
+                        if nxt is not None:
+                            nidx, nk, nim = nxt
+                            read_futures.append(
+                                (nidx, nk, nim, reader_pool.submit(_load_rgb, nim))
+                            )
+
+                        image = fut.result()
+                        if image is None:
+                            raise ValueError(f"Could not read image: {im}")
+
+                        if with_noise:
+                            image = apply_gaussian_noise(
+                                image, mean=noise_mean, variance=noise_variance, rng=seed + idx
+                            )
+                        if with_compression:
+                            image = apply_jpeg_comp(image, quality=jpeg_quality)
+
+                        h_px, w_px = int(image.shape[0]), int(image.shape[1])
+                        r_mean = float(np.mean(image[:, :, 0]))
+                        outputs = mask_generator.generate(image)
+                        del image
+
+                        if len(write_futures) >= max_queued_writes:
+                            write_futures.popleft().result()
+                        write_futures.append(
+                            writer_pool.submit(_write_entry, key, im, h_px, w_px, r_mean, outputs)
+                        )
+
+                    while write_futures:
                         write_futures.popleft().result()
-                    write_futures.append(
-                        writer_pool.submit(_write_entry, key, im, h_px, w_px, r_mean, outputs)
-                    )
-
-                while write_futures:
-                    write_futures.popleft().result()
-                h5.flush()
-            finally:
-                for *_, f in read_futures:
-                    f.cancel()
+                    h5.flush()
+                finally:
+                    for *_, f in read_futures:
+                        f.cancel()
+    except Exception:
+        if not existed_before and out.exists():
+            with h5py.File(out, "r") as check_h5:
+                empty = len(check_h5.keys()) == 0
+            if empty:
+                out.unlink()
+        raise
 
     return out
 

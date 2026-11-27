@@ -121,20 +121,21 @@ def test_embed_extract_roundtrip_and_trailing_zeros():
     assert win == 4 and pad == 0
     assert adapter.extract(keys, win, pad) == msg_exact
 
-    # Case 2: num_zeros > 0 (6-bit message with window_size=4 -> last chunk '11' padded to '1100', pad=2)
-    msg_padded = "101000"
-    # Force window_size=4: chunk0='1010' (k0), chunk1='00' -> '0000' (not in index) -> steps down to w=3:
-    # At w=3: chunk0='101' (k0), chunk1='000' (not in index) -> steps down to w=2:
-    # Let's test explicit padding where chunk1 + '00' matches k2 ('0011' vs '011000'):
-    msg_pad_match = "110101"  # w=4: chunk0='1101' (k1), chunk1='01'->'0100' (no); w=4 for '11010' (5 bits):
-    # chunk0='1101' (k1), chunk1='0' -> '0000' (no). Let's add '010000' so w=4 pads 2 zeros!
+    # Case 2: num_zeros > 0 AND in-place dict mutation invalidates cached _prefix_maps on same adapter!
     clean["k4"] = {"bits": "010000"}
-    adapter = DictBitsAdapter(clean)
     msg_five = "110101"  # len=6 -> w=4: chunk0='1101' (k1), chunk1='01' -> '0100' (k4), pad=2!
     keys2, win2, pad2 = adapter.embed(msg_five, max_window_size=4)
     assert keys2 == ["k1", "k4"]
     assert win2 == 4 and pad2 == 2
     assert adapter.extract(keys2, win2, pad2) == msg_five
+
+    # Toggling adapter config attributes also invalidates cached _prefix_maps
+    bbox_src = {"b0": {"bbox": [[0, 0, 10, 10], [200, 0, 10, 10]]}}
+    bbox_ad = BBoxDistanceAdapter(bbox_src, threshold=300.0)
+    assert bbox_ad.embed("0") == (["b0"], 1, 0)
+    assert bbox_ad.embed("1") == ([], -1, -1)
+    bbox_ad.threshold = 100.0  # distance 200 > 100 -> now encodes '1'
+    assert bbox_ad.embed("1") == (["b0"], 1, 0)
 
     # Empty message and unmatchable message edge cases
     assert adapter.embed("") == ([], 0, 0)
@@ -234,11 +235,33 @@ def test_generate_sam_h5_and_raw_image_fallback(tmp_path):
     assert out_path.name == "SAM_outputs_noise.h5"
     assert " " not in out_path.name
 
-    with h5py.File(out_path, "r") as f:
+    with h5py.File(out_path, "a") as f:
         assert sorted(f.keys()) == ["0000", "0001", "0002"]
         e0 = H5Entry(f["0000"], "0000")
         assert e0["height"] == 32 and e0["width"] == 48 and e0["mask_count"] == 2
         assert "r_mean" in e0 and e0["segmentation"].shape == (2, 32, 48)
+        f.create_group("temp_9999")
+
+        # Reject "/", "temp_*", and dataset paths like "0000/bbox" with KeyError
+        h5_ad = SAMAdapter(f, grid_size=4)
+        for bad_key in ("/", "temp_9999", "0000/bbox"):
+            with pytest.raises(KeyError):
+                h5_ad.extract([bad_key], window_size=4)
+
+    # Empty image directory and unreadable image raise without leaving empty .h5 files behind
+    empty_dir = tmp_path / "empty_imgs"
+    empty_dir.mkdir()
+    missing_out = tmp_path / "never_created.h5"
+    with pytest.raises(FileNotFoundError):
+        generate_sam_h5(missing_out, empty_dir, mg)
+    assert not missing_out.exists()
+
+    bad_jpg = tmp_path / "corrupt.jpg"
+    bad_jpg.write_bytes(b"not a valid jpeg")
+    corrupt_out = tmp_path / "corrupt_out.h5"
+    with pytest.raises(ValueError, match="Could not read image"):
+        generate_sam_h5(corrupt_out, [bad_jpg], mg)
+    assert not corrupt_out.exists()
 
     # Positional mask_generator fallback on raw images
     raw_adapter = SAMAdapter(mg, grid_size=4)
@@ -291,6 +314,23 @@ def test_compute_bit_errors_and_variance_report_math():
     assert noise_sum.exact_match_rate == pytest.approx(0.5)
     assert "noise" in report.format_table()
     assert report.to_dict()["adapter_name"] == "DictBitsAdapter"
+
+    # Unmatchable message ('1111' when all index entries start with '0'): embed_failure_rate == 0.5
+    zero_prefix_src = {"z0": {"bits": "0101"}}
+    fail_report = test_adapter_variance(
+        DictBitsAdapter(zero_prefix_src),
+        zero_prefix_src,
+        {"clean": zero_prefix_src},
+        messages=["0101", "1111"],
+        is_binary=True,
+    )
+    assert fail_report.embed_failure_rate == pytest.approx(0.5)
+    fail_clean = fail_report.conditions["clean"]
+    assert fail_clean.embed_failure_rate == pytest.approx(0.5)
+    assert fail_clean.messages[1].embed_succeeded is False
+    assert fail_clean.messages[1].extracted_bin_msg == ""
+    assert fail_clean.messages[1].ber == pytest.approx(1.0)
+    assert fail_clean.messages[1].exact_match is False
 
 
 # ---------------------------------------------------------------------------
