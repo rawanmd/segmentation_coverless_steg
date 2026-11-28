@@ -1,0 +1,20 @@
+[project]
+name = "segmentation-coverless-steg"
+version = "0.1.0"
+description = "Modular coverless image steganography with SAM HDF5 mask datasets"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "h5py>=3.8",
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
