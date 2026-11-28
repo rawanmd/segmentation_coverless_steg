@@ -21,6 +21,7 @@ from coverless_steg import (
     BBoxDistanceAdapter,
     CoverlessStegPort,
     H5Entry,
+    IndexedStegAdapter,
     SAMAdapter,
     apply_gaussian_noise,
     apply_jpeg_comp,
@@ -94,15 +95,119 @@ def test_in_memory_gaussian_noise_and_jpeg_no_disk_side_effects(tmp_path, monkey
 
 
 # ---------------------------------------------------------------------------
-# 2. CoverlessStegPort contract, trailing zeros, and short-chunk handling
+# 2. Pure CoverlessStegPort & IndexedStegAdapter contracts
 # ---------------------------------------------------------------------------
 
 
-class DictBitsAdapter(CoverlessStegPort):
-    """Minimal 4-line custom adapter for deterministic port testing."""
+class DictBitsAdapter(IndexedStegAdapter):
+    """Minimal 4-line indexed adapter for deterministic lookup testing."""
 
     def encode_entry(self, entry) -> str:
         return str(entry.get("bits", ""))
+
+
+def test_pure_coverless_steg_port_contract_and_variance():
+    # Pure port defines ONLY embed and extract (zero mask/index/H5 assumptions).
+    assert CoverlessStegPort.__abstractmethods__ == frozenset({"embed", "extract"})
+    for leaked_attr in ("encode_entry", "build_index", "build_prefix_maps", "mask_generator"):
+        assert not hasattr(CoverlessStegPort, leaked_attr)
+    assert issubclass(IndexedStegAdapter, CoverlessStegPort)
+    assert issubclass(SAMAdapter, IndexedStegAdapter)
+    assert issubclass(BBoxDistanceAdapter, IndexedStegAdapter)
+
+    with pytest.raises(TypeError):
+        class IncompleteAdapter(CoverlessStegPort):
+            def embed(self, binary_msg: str):
+                return binary_msg
+
+        IncompleteAdapter()  # type: ignore[abstract]
+
+    # Pure CoverlessStegPort #1: list-of-keys payload (zero H5, zero masks, zero build_index)
+    class NibbleListPortAdapter(CoverlessStegPort):
+        def __init__(self, table: dict[str, str]):
+            self.table = table
+
+        def embed(self, binary_msg: str) -> list[str] | None:
+            if binary_msg == "":
+                return []
+            inv = {bits: cid for cid, bits in self.table.items()}
+            out: list[str] = []
+            for i in range(0, len(binary_msg), 2):
+                cid = inv.get(binary_msg[i : i + 2])
+                if cid is None:
+                    return []
+                out.append(cid)
+            return out
+
+        def extract(self, payload: list[str], source=None) -> str:
+            src = self.table if source is None else source
+            return "".join(src[cid] for cid in payload)
+
+    clean_tbl = {"c0": "00", "c1": "01", "c2": "10"}  # '11' intentionally absent to test embed failure
+    noisy_tbl = {"c0": "00", "c1": "11", "c2": "10"}  # c1 flips 1 bit under perturbation
+    pure_list = NibbleListPortAdapter(clean_tbl)
+    assert isinstance(pure_list, CoverlessStegPort)
+    assert not isinstance(pure_list, IndexedStegAdapter)
+
+    list_report = test_adapter_variance(
+        pure_list,
+        extraction_sources={"clean": clean_tbl, "noisy": noisy_tbl},
+        messages=["", "0110", "1000", "1111"],
+        is_binary=True,
+    )
+    assert list_report.index_keys == 0
+    assert list_report.embed_failure_rate == pytest.approx(0.25)  # only '1111' fails
+    clean_msgs = list_report.conditions["clean"].messages
+    assert [m.embed_succeeded for m in clean_msgs] == [True, True, True, False]
+    assert [m.exact_match for m in clean_msgs] == [True, True, True, False]
+    assert clean_msgs[0].images_used == 0 and clean_msgs[0].ber == 0.0
+    assert clean_msgs[1].images_used == 2 and clean_msgs[1].window_size == 2
+    assert clean_msgs[3].ber == pytest.approx(1.0)
+
+    noisy_msgs = list_report.conditions["noisy"].messages
+    # "" -> 0.0, "0110" -> "1110" (1/4=0.25), "1000" -> "1000" (0.0), "1111" -> failed (1.0)
+    assert [m.ber for m in noisy_msgs] == pytest.approx([0.0, 0.25, 0.0, 1.0])
+    assert list_report.conditions["noisy"].mean_ber == pytest.approx(0.3125)
+
+    # Pure CoverlessStegPort #2: non-tuple dict payload
+    class DictPayloadPortAdapter(CoverlessStegPort):
+        def __init__(self, carriers: dict[str, np.ndarray]):
+            self.carriers = carriers
+
+        def embed(self, binary_msg: str) -> dict[str, object] | None:
+            if len(binary_msg) > len(self.carriers):
+                return None
+            chosen: list[str] = []
+            inv_flags: list[bool] = []
+            for key, bit in zip(sorted(self.carriers), binary_msg):
+                parity = "1" if float(np.mean(self.carriers[key])) >= 128.0 else "0"
+                chosen.append(key)
+                inv_flags.append(parity != bit)
+            return {"keys": chosen, "invert": inv_flags}
+
+        def extract(self, payload: dict[str, object], source=None) -> str:
+            src = self.carriers if source is None else source
+            bits: list[str] = []
+            for key, inv in zip(payload["keys"], payload["invert"]):  # type: ignore[index]
+                b = float(np.mean(src[key])) >= 128.0
+                bits.append("1" if (not b if inv else b) else "0")
+            return "".join(bits)
+
+    c_imgs = {f"p{i}": np.full((4, 4), 40 * i, dtype=np.uint8) for i in range(6)}
+    n_imgs = dict(c_imgs)
+    n_imgs["p0"] = np.full((4, 4), 200, dtype=np.uint8)  # flip p0 across 128 threshold
+    dict_port = DictPayloadPortAdapter(c_imgs)
+    dict_report = test_adapter_variance(
+        dict_port,
+        c_imgs,
+        {"clean": c_imgs, "perturbed": n_imgs},
+        messages=["", "1010", "10101010"],  # len 8 > 6 carriers -> None failure
+        is_binary=True,
+    )
+    assert dict_report.embed_failure_rate == pytest.approx(1 / 3)
+    assert dict_report.conditions["clean"].messages[1].exact_match is True
+    assert dict_report.conditions["clean"].messages[1].images_used == 1
+    assert dict_report.conditions["perturbed"].messages[1].hamming_distance == 1
 
 
 def test_embed_extract_roundtrip_and_trailing_zeros():
@@ -114,20 +219,25 @@ def test_embed_extract_roundtrip_and_trailing_zeros():
     }
     adapter = DictBitsAdapter(clean)
 
-    # Case 1: num_zeros == 0 (exact multiple of window_size=4 -> 8 bits across 2 keys)
+    # Case 1: num_zeros == 0 (both positional args and 3-tuple payload supported in extract)
     msg_exact = "10101101"
-    keys, win, pad = adapter.embed(msg_exact, max_window_size=4)
+    payload = adapter.embed(msg_exact, max_window_size=4)
+    keys, win, pad = payload
     assert keys == ["k0", "k1"]
     assert win == 4 and pad == 0
     assert adapter.extract(keys, win, pad) == msg_exact
+    assert adapter.extract(payload) == msg_exact
+    assert adapter.extract(payload, source=clean) == msg_exact
 
     # Case 2: num_zeros > 0 AND in-place dict mutation invalidates cached _prefix_maps on same adapter!
     clean["k4"] = {"bits": "010000"}
     msg_five = "110101"  # len=6 -> w=4: chunk0='1101' (k1), chunk1='01' -> '0100' (k4), pad=2!
-    keys2, win2, pad2 = adapter.embed(msg_five, max_window_size=4)
+    payload2 = adapter.embed(msg_five, max_window_size=4)
+    keys2, win2, pad2 = payload2
     assert keys2 == ["k1", "k4"]
     assert win2 == 4 and pad2 == 2
     assert adapter.extract(keys2, win2, pad2) == msg_five
+    assert adapter.extract(payload2) == msg_five
 
     # Toggling adapter config attributes also invalidates cached _prefix_maps
     bbox_src = {"b0": {"bbox": [[0, 0, 10, 10], [200, 0, 10, 10]]}}
@@ -137,15 +247,20 @@ def test_embed_extract_roundtrip_and_trailing_zeros():
     bbox_ad.threshold = 100.0  # distance 200 > 100 -> now encodes '1'
     assert bbox_ad.embed("1") == (["b0"], 1, 0)
 
-    # Empty message and unmatchable message edge cases
-    assert adapter.embed("") == ([], 0, 0)
+    # Empty message and unmatchable message edge cases (both positional and 3-tuple)
+    empty_payload = adapter.embed("")
+    assert empty_payload == ([], 0, 0)
     assert adapter.extract([], 0, 0) == ""
+    assert adapter.extract(empty_payload) == ""
 
     no_match_adapter = DictBitsAdapter({"only_zeros": {"bits": "0000"}})
     failed = no_match_adapter.embed("1111")
     assert failed == ([], -1, -1)
     assert no_match_adapter.extract(*failed) == ""
+    assert no_match_adapter.extract(failed) == ""
 
+    with pytest.raises(TypeError):
+        adapter.extract(["k0"])  # missing window_size when not a 3-tuple
     with pytest.raises(ValueError):
         adapter.embed("10a1")
 

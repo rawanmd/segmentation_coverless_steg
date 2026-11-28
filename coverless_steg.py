@@ -1,4 +1,4 @@
-"""Modular coverless image steganography over precomputed SAM HDF5 masks."""
+"""Modular coverless image steganography port, indexed SAM HDF5 adapters, and variance tester."""
 
 from __future__ import annotations
 
@@ -306,7 +306,19 @@ def build_prefix_maps(index: Mapping[str, Sequence[Any]]) -> dict[int, dict[str,
 
 
 class CoverlessStegPort(ABC):
-    """Base port for coverless steganography adapters.
+    """Pure hexagonal port for coverless steganography adapters."""
+
+    @abstractmethod
+    def embed(self, binary_msg: str, **kwargs: Any) -> Any:
+        """Embed *binary_msg* and return an adapter-defined stego payload."""
+
+    @abstractmethod
+    def extract(self, payload: Any, *args: Any, source: Any = None, **kwargs: Any) -> str:
+        """Extract the embedded binary bitstring from *payload* (optionally over *source*)."""
+
+
+class IndexedStegAdapter(CoverlessStegPort):
+    """Lookup-index base adapter over HDF5, dict, or raw image entries.
 
     Subclasses only need to implement ``encode_entry(entry) -> str``.
     """
@@ -429,40 +441,65 @@ class CoverlessStegPort(ABC):
 
     def extract(
         self,
-        matched_keys: Sequence[str],
-        window_size: int,
+        payload: Sequence[str] | tuple[Sequence[str], int, int],
+        window_size: int | None = None,
         num_zeros: int = 0,
         source: Any = None,
     ) -> str:
-        """Re-encode *matched_keys* in order from *source* and strip *num_zeros* padding."""
-        if not matched_keys or window_size <= 0:
+        """Re-encode *payload* keys in order from *source* and strip *num_zeros* padding."""
+        if window_size is None:
+            if (
+                isinstance(payload, tuple)
+                and len(payload) == 3
+                and (
+                    payload[0] is None
+                    or (isinstance(payload[0], Sequence) and not isinstance(payload[0], (str, bytes)))
+                )
+                and isinstance(payload[1], (int, np.integer))
+                and not isinstance(payload[1], bool)
+                and isinstance(payload[2], (int, np.integer))
+                and not isinstance(payload[2], bool)
+            ):
+                matched_keys: Sequence[str] = payload[0] or ()
+                win = int(payload[1])
+                pad = int(payload[2])
+            else:
+                raise TypeError(
+                    "extract() requires window_size or a (matched_keys, window_size, num_zeros) tuple."
+                )
+        else:
+            matched_keys = payload  # type: ignore[assignment]
+            win = int(window_size)
+            pad = int(num_zeros)
+
+        if not matched_keys or win <= 0:
             return ""
-        if num_zeros < 0:
-            raise ValueError(f"num_zeros must be >= 0, got {num_zeros}")
+        if pad < 0:
+            raise ValueError(f"num_zeros must be >= 0, got {pad}")
 
         target = self.source if source is None else source
         chunks: list[str] = []
         with _open_source(target, self.mask_generator) as (_, get_entry, _):
             for key in matched_keys:
                 seq = self.encode_entry(get_entry(key)) or ""
-                if len(seq) < window_size:
+                if len(seq) < win:
                     warnings.warn(
-                        f"Extracted chunk for {key!r} has length {len(seq)} < window_size={window_size}; "
+                        f"Extracted chunk for {key!r} has length {len(seq)} < window_size={win}; "
                         "right-padding with '0'.",
                         RuntimeWarning,
                         stacklevel=2,
                     )
-                    chunks.append(seq.ljust(window_size, "0"))
+                    chunks.append(seq.ljust(win, "0"))
                 else:
-                    chunks.append(seq[:window_size])
+                    chunks.append(seq[:win])
 
         bin_msg = "".join(chunks)
-        if num_zeros > 0:
-            bin_msg = bin_msg[:-num_zeros] if num_zeros < len(bin_msg) else ""
+        if pad > 0:
+            bin_msg = bin_msg[:-pad] if pad < len(bin_msg) else ""
         return bin_msg
 
 
-class SAMAdapter(CoverlessStegPort):
+class SAMAdapter(IndexedStegAdapter):
     """Grid-neighbor SAM mask adapter supporting precomputed H5/dict or raw images."""
 
     def __init__(
@@ -494,7 +531,7 @@ class SAMAdapter(CoverlessStegPort):
         return compare_neighbors(features, self.tolerance)
 
 
-class BBoxDistanceAdapter(CoverlessStegPort):
+class BBoxDistanceAdapter(IndexedStegAdapter):
     """Lightweight adapter encoding pairwise Euclidean distances between mask bboxes."""
 
     def __init__(self, source: Any = None, threshold: float = 300.0, mask_generator: Any = None):
@@ -747,9 +784,43 @@ class VarianceReport:
         return self.format_table()
 
 
+def _inspect_payload(bin_msg: str, payload: Any) -> tuple[bool, list[str], int, int, int]:
+    """Normalize an arbitrary ``CoverlessStegPort.embed`` return value into report metadata."""
+    if payload is None or payload is False:
+        return False, [], -1, -1, 0
+    if (
+        isinstance(payload, tuple)
+        and len(payload) == 3
+        and (
+            payload[0] is None
+            or (isinstance(payload[0], Sequence) and not isinstance(payload[0], (str, bytes)))
+        )
+        and isinstance(payload[1], (int, np.integer))
+        and not isinstance(payload[1], bool)
+        and isinstance(payload[2], (int, np.integer))
+        and not isinstance(payload[2], bool)
+    ):
+        w_size, num_zeros = int(payload[1]), int(payload[2])
+        if w_size < 0:
+            return False, [], -1, -1, 0
+        keys = [str(k) for k in (payload[0] or ())]
+        return True, keys, w_size, num_zeros, len(keys)
+    if isinstance(payload, (list, tuple)):
+        if len(payload) == 0:
+            return (True, [], 0, 0, 0) if bin_msg == "" else (False, [], -1, -1, 0)
+        keys = [str(k) for k in payload]
+        n = len(keys)
+        w_size = math.ceil(len(bin_msg) / n) if bin_msg else 0
+        return True, keys, w_size, 0, n
+    if isinstance(payload, (str, bytes, Mapping)) and len(payload) == 0:
+        return (True, [], 0, 0, 0) if bin_msg == "" else (False, [], -1, -1, 0)
+    n = 1 if bin_msg else 0
+    return True, [], len(bin_msg), 0, n
+
+
 def test_adapter_variance(
     adapter: CoverlessStegPort,
-    clean_source: Any,
+    clean_source: Any = None,
     extraction_sources: Mapping[str, Any] | Any = None,
     messages: Sequence[str] = ("HelloWorld", "Coverless", "SAM Steg"),
     *,
@@ -766,12 +837,22 @@ def test_adapter_variance(
     else:
         sources_map = extraction_sources
 
-    t_idx = time.perf_counter()
-    index = adapter.build_index(clean_source)
-    prefix_maps = adapter.build_prefix_maps(index)
-    index_build_sec = time.perf_counter() - t_idx
+    is_indexed = isinstance(adapter, IndexedStegAdapter) or callable(
+        getattr(adapter, "build_index", None)
+    )
+    if is_indexed:
+        t_idx = time.perf_counter()
+        index = adapter.build_index(clean_source)  # type: ignore[attr-defined]
+        p_builder = getattr(adapter, "build_prefix_maps", build_prefix_maps)
+        prefix_maps = p_builder(index)
+        index_build_sec = time.perf_counter() - t_idx
+        index_keys = len(index)
+    else:
+        prefix_maps = None
+        index_build_sec = 0.0
+        index_keys = 0
 
-    prepared: list[tuple[str, str, list[str], int, int, bool]] = []
+    prepared: list[tuple[str, str, Any, list[str], int, int, int, bool]] = []
     for msg in messages:
         treat_as_bin = (
             is_binary
@@ -779,17 +860,22 @@ def test_adapter_variance(
             else (len(msg) > 0 and all(ch in ("0", "1") for ch in msg))
         )
         bin_msg = msg if treat_as_bin else string_to_binary(msg)
-        matched_keys, w_size, num_zeros = adapter.embed(
-            bin_msg, max_window_size=max_window_size, prefix_maps=prefix_maps
-        )
-        succeeded = w_size >= 0
-        prepared.append((msg, bin_msg, matched_keys, w_size, num_zeros, succeeded))
+        if is_indexed:
+            payload = adapter.embed(
+                bin_msg, max_window_size=max_window_size, prefix_maps=prefix_maps
+            )
+        elif max_window_size is not None:
+            payload = adapter.embed(bin_msg, max_window_size=max_window_size)
+        else:
+            payload = adapter.embed(bin_msg)
+        ok, matched_keys, w_size, num_zeros, imgs_used = _inspect_payload(bin_msg, payload)
+        prepared.append((msg, bin_msg, payload, matched_keys, w_size, num_zeros, imgs_used, ok))
 
     total = len(prepared)
     embed_failures = sum(1 for *_, ok in prepared if not ok)
     embed_failure_rate = (embed_failures / total) if total > 0 else 0.0
-    succeeded_wins = [w for _, _, _, w, _, ok in prepared if ok]
-    succeeded_imgs = [len(k) for _, _, k, _, _, ok in prepared if ok]
+    succeeded_wins = [w for *_, w, _, _, ok in prepared if ok]
+    succeeded_imgs = [n for *_, n, ok in prepared if ok]
     avg_win = float(np.mean(succeeded_wins)) if succeeded_wins else 0.0
     avg_imgs = float(np.mean(succeeded_imgs)) if succeeded_imgs else 0.0
 
@@ -798,16 +884,26 @@ def test_adapter_variance(
         t0 = time.perf_counter()
         msg_results: list[MessageResult] = []
 
-        # Keep HDF5 file open across all messages in a condition rather than reopening per message.
-        with _open_source(target_source, adapter.mask_generator) as (_, _, open_ref):
-            for raw_msg, bin_msg, matched_keys, w_size, num_zeros, ok in prepared:
+        # Keep HDF5 file open across all messages in a condition when using IndexedStegAdapter.
+        src_ctx = (
+            _open_source(target_source, getattr(adapter, "mask_generator", None))
+            if is_indexed
+            else nullcontext((None, None, target_source))
+        )
+        with src_ctx as (_, _, open_ref):
+            for raw_msg, bin_msg, payload, matched_keys, w_size, num_zeros, imgs_used, ok in prepared:
                 if ok:
-                    ext_bits = adapter.extract(
-                        matched_keys, w_size, num_zeros=num_zeros, source=open_ref
-                    )
+                    if is_indexed:
+                        ext_bits = adapter.extract(
+                            matched_keys, w_size, num_zeros=num_zeros, source=open_ref
+                        )
+                    else:
+                        ext_bits = adapter.extract(payload, source=open_ref)
                 else:
                     ext_bits = ""
                 bit_err, ber = compute_bit_errors(bin_msg, ext_bits)
+                if not ok and bin_msg == "":
+                    ber = 1.0
                 exact = ok and (ext_bits == bin_msg)
                 msg_results.append(
                     MessageResult(
@@ -818,7 +914,7 @@ def test_adapter_variance(
                         matched_keys=list(matched_keys),
                         window_size=w_size,
                         num_zeros=num_zeros,
-                        images_used=len(matched_keys),
+                        images_used=imgs_used,
                         hamming_distance=bit_err,
                         ber=ber,
                         exact_match=exact,
@@ -847,7 +943,7 @@ def test_adapter_variance(
 
     return VarianceReport(
         adapter_name=type(adapter).__name__,
-        index_keys=len(index),
+        index_keys=index_keys,
         index_build_sec=index_build_sec,
         embed_failure_rate=embed_failure_rate,
         conditions=conditions,
